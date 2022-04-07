@@ -13,6 +13,7 @@
 #include <linux/hrtimer.h>
 #include <linux/kernel.h>
 #include <linux/kallsyms.h>
+#include <linux/kprobes.h>
 #include <linux/module.h>
 #include <linux/percpu.h>
 #include <linux/proc_fs.h>
@@ -47,6 +48,7 @@
 #define MAX_STACE_TRACE_ENTRIES		\
 	(MAX_TRACE_ENTRIES / PER_TRACE_ENTRIES_AVERAGE)
 
+#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 6, 0)
 #define DEFINE_PROC_ATTRIBUTE(name, __write)				\
 	static int name##_open(struct inode *inode, struct file *file)	\
 	{								\
@@ -61,6 +63,21 @@
 		.llseek		= seq_lseek,				\
 		.release	= single_release,			\
 	}
+#else /* LINUX_VERSION_CODE */
+#define DEFINE_PROC_ATTRIBUTE(name, __write)				\
+	static int name##_open(struct inode *inode, struct file *file)	\
+	{								\
+		return single_open(file, name##_show, PDE_DATA(inode));	\
+	}								\
+									\
+	static const struct proc_ops name##_fops = {			\
+		.proc_open	= name##_open,				\
+		.proc_read	= seq_read,				\
+		.proc_write	= __write,				\
+		.proc_lseek	= seq_lseek,				\
+		.proc_release	= single_release,			\
+	}
+#endif /* LINUX_VERSION_CODE */
 
 #define DEFINE_PROC_ATTRIBUTE_RW(name)					\
 	static ssize_t name##_write(struct file *file,			\
@@ -176,11 +193,42 @@ static unsigned int (*stack_trace_save_skip_hardirq)(struct pt_regs *regs,
 						     unsigned int size,
 						     unsigned int skipnr);
 
+#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 6, 0)
 static inline void stack_trace_skip_hardirq_init(void)
 {
 	stack_trace_save_skip_hardirq =
 			(void *)kallsyms_lookup_name("stack_trace_save_regs");
 }
+#else /* LINUX_VERSION_CODE */
+static int handler_pre(struct kprobe *p, struct pt_regs *regs){
+	return 0;
+}
+
+/**
+ * Use kallsyms_lookup_name to find symbols.
+ */
+static void stack_trace_skip_hardirq_init(void)
+{
+	int ret = -1;
+	struct kprobe kp;
+	unsigned long (*kallsyms_lookup_name_fun)(const char *name);
+
+	kp.symbol_name = "kallsyms_lookup_name";
+	kp.pre_handler = handler_pre;
+	stack_trace_save_skip_hardirq = NULL;
+
+	ret = register_kprobe(&kp);
+	if (ret < 0) {
+		return;
+	}
+
+	kallsyms_lookup_name_fun = (void*)kp.addr;
+	unregister_kprobe(&kp);
+
+	stack_trace_save_skip_hardirq =
+		(void *)kallsyms_lookup_name_fun("stack_trace_save_regs");
+}
+#endif  /* LINUX_VERSION_CODE */
 
 static inline void store_stack_trace(struct pt_regs *regs,
 				     struct stack_entry *stack_entry,
